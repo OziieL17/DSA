@@ -4,6 +4,7 @@ __all__ = [
     "dicom_io",
     "preprocessing",
     "segmentation",
+    "vesselness",
     "centerlines",
     "temporal_analysis",
     "geometry",
