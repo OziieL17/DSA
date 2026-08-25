@@ -6,10 +6,8 @@ black-box model. The user previews and adjusts the threshold before accepting.
 
 try:
     import slicer
-    import vtk
 except ImportError:
     slicer = None
-    vtk = None
 
 
 def scalar_range(volume_node):
@@ -34,7 +32,12 @@ def percentile_threshold(volume_node, percentile=99.0, sample_limit=1000000):
 
 
 def create_preview(volume_node, lower_threshold, upper_threshold=None, segmentation_node=None):
-    """Create/update a threshold-based vascular preview in Segment Editor."""
+    """Create/update a 2D labelmap preview in Segment Editor.
+
+    Closed-surface generation is intentionally deferred. A 512x512x399 labelmap
+    can be very large, and generating a full 3D surface before cropping/cleaning
+    may exhaust memory or fail in vtkDiscreteFlyingEdges3D.
+    """
     if slicer is None:
         raise RuntimeError("Segmentation must run inside 3D Slicer.")
     if upper_threshold is None:
@@ -44,6 +47,9 @@ def create_preview(volume_node, lower_threshold, upper_threshold=None, segmentat
         segmentation_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", "DSAFlow_Vessels_Preview")
         segmentation_node.CreateDefaultDisplayNodes()
         segmentation_node.SetReferenceImageGeometryParameterFromVolumeNode(volume_node)
+
+    # Remove any stale closed-surface representation from previous runs.
+    segmentation_node.RemoveClosedSurfaceRepresentation()
 
     segmentation = segmentation_node.GetSegmentation()
     segment_id = segmentation.GetSegmentIdBySegmentName("Vessels")
@@ -70,7 +76,12 @@ def create_preview(volume_node, lower_threshold, upper_threshold=None, segmentat
         editor.setActiveEffectByName("")
         slicer.mrmlScene.RemoveNode(parameter_node)
 
-    segmentation_node.CreateClosedSurfaceRepresentation()
+    display = segmentation_node.GetDisplayNode()
+    if display:
+        display.SetVisibility2DFill(True)
+        display.SetVisibility2DOutline(True)
+        display.SetVisibility3D(False)
+
     return segmentation_node
 
 
