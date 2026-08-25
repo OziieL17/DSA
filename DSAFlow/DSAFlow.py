@@ -29,7 +29,7 @@ class DSAFlowWidget(ScriptedLoadableModuleWidget):
         self.volumeNode = None
         self.segmentationNode = None
 
-        intro = qt.QLabel("<b>DSA Flow</b><br>Guided workflow: validate → load 3D SUB → preview → adjust → accept.")
+        intro = qt.QLabel("<b>DSA Flow</b><br>Guided workflow: validate → load 3D SUB → raw preview → clean preview → 3D preview → accept.")
         intro.wordWrap = True
         self.layout.addWidget(intro)
 
@@ -43,7 +43,7 @@ class DSAFlowWidget(ScriptedLoadableModuleWidget):
 
         self.results = qt.QTextEdit()
         self.results.readOnly = True
-        self.results.minimumHeight = 220
+        self.results.minimumHeight = 180
         self.layout.addWidget(self.results)
 
         self.loadButton = qt.QPushButton("2. Load best 3D subtraction volume")
@@ -56,7 +56,7 @@ class DSAFlowWidget(ScriptedLoadableModuleWidget):
         self.layout.addWidget(self.volumeStatus)
 
         thresholdRow = qt.QHBoxLayout()
-        thresholdRow.addWidget(qt.QLabel("Lower threshold:"))
+        thresholdRow.addWidget(qt.QLabel("Lower:"))
         self.thresholdSpin = qt.QDoubleSpinBox()
         self.thresholdSpin.decimals = 1
         self.thresholdSpin.minimum = -5000
@@ -64,23 +64,78 @@ class DSAFlowWidget(ScriptedLoadableModuleWidget):
         self.thresholdSpin.singleStep = 10
         self.thresholdSpin.enabled = False
         thresholdRow.addWidget(self.thresholdSpin)
-        self.autoButton = qt.QPushButton("Auto (99th percentile)")
+
+        thresholdRow.addWidget(qt.QLabel("Upper:"))
+        self.upperSpin = qt.QDoubleSpinBox()
+        self.upperSpin.decimals = 1
+        self.upperSpin.minimum = -5000
+        self.upperSpin.maximum = 100000
+        self.upperSpin.singleStep = 100
+        self.upperSpin.enabled = False
+        thresholdRow.addWidget(self.upperSpin)
+
+        self.autoButton = qt.QPushButton("Auto")
         self.autoButton.enabled = False
         self.autoButton.connect("clicked()", self.onAutoThreshold)
         thresholdRow.addWidget(self.autoButton)
         self.layout.addLayout(thresholdRow)
 
-        self.previewButton = qt.QPushButton("3. Generate / update vascular preview")
-        self.previewButton.enabled = False
-        self.previewButton.connect("clicked()", self.onPreview)
-        self.layout.addWidget(self.previewButton)
+        self.rawButton = qt.QPushButton("3A. Generate raw threshold preview")
+        self.rawButton.enabled = False
+        self.rawButton.connect("clicked()", self.onRawPreview)
+        self.layout.addWidget(self.rawButton)
 
-        self.acceptButton = qt.QPushButton("4. Accept preview and continue")
+        cleanupRow = qt.QHBoxLayout()
+        cleanupRow.addWidget(qt.QLabel("Min component voxels:"))
+        self.minVoxelSpin = qt.QSpinBox()
+        self.minVoxelSpin.minimum = 1
+        self.minVoxelSpin.maximum = 1000000
+        self.minVoxelSpin.value = 150
+        self.minVoxelSpin.enabled = False
+        cleanupRow.addWidget(self.minVoxelSpin)
+        cleanupRow.addWidget(qt.QLabel("Max components:"))
+        self.maxComponentsSpin = qt.QSpinBox()
+        self.maxComponentsSpin.minimum = 1
+        self.maxComponentsSpin.maximum = 500
+        self.maxComponentsSpin.value = 40
+        self.maxComponentsSpin.enabled = False
+        cleanupRow.addWidget(self.maxComponentsSpin)
+        self.layout.addLayout(cleanupRow)
+
+        self.cleanButton = qt.QPushButton("3B. Clean connected components")
+        self.cleanButton.enabled = False
+        self.cleanButton.connect("clicked()", self.onCleanPreview)
+        self.layout.addWidget(self.cleanButton)
+
+        modeRow = qt.QHBoxLayout()
+        self.showRawButton = qt.QPushButton("Show raw")
+        self.showRawButton.enabled = False
+        self.showRawButton.connect("clicked()", lambda: self.onMode("raw"))
+        modeRow.addWidget(self.showRawButton)
+        self.showCleanButton = qt.QPushButton("Show clean")
+        self.showCleanButton.enabled = False
+        self.showCleanButton.connect("clicked()", lambda: self.onMode("clean"))
+        modeRow.addWidget(self.showCleanButton)
+        self.layout.addLayout(modeRow)
+
+        self.statsLabel = qt.QLabel("Cleanup statistics: not generated")
+        self.statsLabel.wordWrap = True
+        self.layout.addWidget(self.statsLabel)
+
+        self.surfaceButton = qt.QPushButton("3C. Generate controlled 3D vascular preview")
+        self.surfaceButton.enabled = False
+        self.surfaceButton.connect("clicked()", self.on3DPreview)
+        self.layout.addWidget(self.surfaceButton)
+
+        self.acceptButton = qt.QPushButton("4. Accept clean segmentation")
         self.acceptButton.enabled = False
         self.acceptButton.connect("clicked()", self.onAccept)
         self.layout.addWidget(self.acceptButton)
 
-        note = qt.QLabel("The 3DANGIO SUB series is already a vendor-generated subtraction reconstruction; DSAFlow does not subtract Fill-Mask again at this step. Preview is shown in 2D first to avoid an unnecessary full-volume surface extraction. No direct patient identifiers are displayed.")
+        note = qt.QLabel(
+            "Raw preview shows everything passing the intensity threshold. Clean preview removes small disconnected islands and retains only the largest connected vascular components. "
+            "The first true 3D surface is generated only after cleanup. If this still does not resemble the vascular tree you expect, do not accept it; threshold and cleanup remain editable."
+        )
         note.wordWrap = True
         self.layout.addWidget(note)
         self.layout.addStretch(1)
@@ -109,16 +164,16 @@ class DSAFlowWidget(ScriptedLoadableModuleWidget):
             dims = self.volumeNode.GetImageData().GetDimensions()
             spacing = self.volumeNode.GetSpacing()
             self.volumeStatus.text = (
-                f"Loaded full 3D SUB: {self.volumeNode.GetName()} | "
-                f"dimensions {dims[0]}×{dims[1]}×{dims[2]} | "
-                f"spacing {spacing[0]:.4f}×{spacing[1]:.4f}×{spacing[2]:.4f} mm | "
-                f"intensity {lo:.1f} to {hi:.1f}"
+                f"Loaded full 3D SUB: {self.volumeNode.GetName()} | dimensions {dims[0]}×{dims[1]}×{dims[2]} | "
+                f"spacing {spacing[0]:.4f}×{spacing[1]:.4f}×{spacing[2]:.4f} mm | intensity {lo:.1f} to {hi:.1f}"
             )
-            self.thresholdSpin.minimum = min(-5000, lo)
-            self.thresholdSpin.maximum = max(100000, hi)
-            self.thresholdSpin.enabled = True
-            self.autoButton.enabled = True
-            self.previewButton.enabled = True
+            self.thresholdSpin.minimum = lo
+            self.thresholdSpin.maximum = hi
+            self.upperSpin.minimum = lo
+            self.upperSpin.maximum = hi
+            self.upperSpin.value = hi
+            for w in [self.thresholdSpin, self.upperSpin, self.autoButton, self.rawButton, self.minVoxelSpin, self.maxComponentsSpin]:
+                w.enabled = True
             self.onAutoThreshold()
             slicer.util.setSliceViewerLayers(background=self.volumeNode, fit=True)
         except Exception as exc:
@@ -128,25 +183,61 @@ class DSAFlowWidget(ScriptedLoadableModuleWidget):
         try:
             value = self.logic.autoThreshold(self.volumeNode)
             self.thresholdSpin.value = value
+            self.upperSpin.value = self.logic.volumeRange(self.volumeNode)[1]
             self.volumeStatus.text = self.volumeStatus.text.split(" | suggested threshold")[0] + f" | suggested threshold {value:.1f}"
         except Exception as exc:
             slicer.util.errorDisplay(str(exc))
 
-    def onPreview(self):
+    def onRawPreview(self):
         try:
-            self.segmentationNode = self.logic.preview(self.volumeNode, self.thresholdSpin.value, self.segmentationNode)
-            self.acceptButton.enabled = True
-            self.volumeStatus.text = self.volumeStatus.text.split(" | preview")[0] + f" | 2D preview ≥ {self.thresholdSpin.value:.1f}"
+            self.segmentationNode = self.logic.rawPreview(self.volumeNode, self.thresholdSpin.value, self.upperSpin.value, self.segmentationNode)
+            self.cleanButton.enabled = True
+            self.showRawButton.enabled = True
+            self.volumeStatus.text = self.volumeStatus.text.split(" | preview")[0] + f" | raw preview {self.thresholdSpin.value:.1f}–{self.upperSpin.value:.1f}"
             slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
         except Exception as exc:
-            slicer.util.errorDisplay(f"Preview failed:\n{exc}")
+            slicer.util.errorDisplay(f"Raw preview failed:\n{exc}")
+
+    def onCleanPreview(self):
+        try:
+            self.segmentationNode, stats = self.logic.cleanPreview(
+                self.volumeNode,
+                self.thresholdSpin.value,
+                self.upperSpin.value,
+                self.minVoxelSpin.value,
+                self.maxComponentsSpin.value,
+                self.segmentationNode,
+            )
+            self.showRawButton.enabled = True
+            self.showCleanButton.enabled = True
+            self.surfaceButton.enabled = True
+            self.acceptButton.enabled = True
+            self.statsLabel.text = (
+                f"Cleanup statistics: {stats['components_total']} components detected; {stats['components_retained']} retained. "
+                f"Voxels {stats['raw_voxels']:,} → {stats['clean_voxels']:,} ({100*stats['retained_fraction']:.1f}% retained). "
+                f"Largest component: {stats['largest_component_voxels']:,} voxels."
+            )
+            self.logic.setMode(self.segmentationNode, "clean")
+        except Exception as exc:
+            slicer.util.errorDisplay(f"Cleanup failed:\n{exc}")
+
+    def onMode(self, mode):
+        self.logic.setMode(self.segmentationNode, mode)
+
+    def on3DPreview(self):
+        try:
+            self.logic.create3D(self.segmentationNode)
+            slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+            self.statsLabel.text += " | 3D surface generated from CleanVessels."
+        except Exception as exc:
+            slicer.util.errorDisplay(f"3D preview failed:\n{exc}")
 
     def onAccept(self):
         if not self.segmentationNode:
             return
         self.segmentationNode.SetName("DSAFlow_Vessels_Accepted")
         self.acceptButton.enabled = False
-        slicer.util.infoDisplay("Preview accepted. Next milestone: crop/connected-component cleanup, then controlled 3D surface generation and centerline extraction.")
+        slicer.util.infoDisplay("Clean segmentation accepted. Next milestone: vascular model optimization and centerline extraction.")
 
 
 class DSAFlowLogic(ScriptedLoadableModuleLogic):
@@ -165,27 +256,17 @@ class DSAFlowLogic(ScriptedLoadableModuleLogic):
         return max(candidates, key=lambda r: (r.valid, r.score, r.file_count), default=None)
 
     def loadSeries(self, series_uid):
-        """Load the complete DICOM series through Slicer's DICOM plugin machinery.
-
-        Do not call slicer.util.loadVolume on the first DICOM file: that route can
-        load only one slice or invoke a generic ITK reader and lose series geometry.
-        """
         db = slicer.dicomDatabase
         files = list(db.filesForSeries(series_uid))
         if not files:
             raise RuntimeError("Selected DICOM series contains no files.")
-
-        # Reuse an already-loaded matching volume when possible.
         for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
             uid = node.GetAttribute("DICOM.SeriesInstanceUID")
             if uid == series_uid and node.GetImageData() is not None:
                 return node
-
         before_ids = {node.GetID() for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")}
-
         from DICOMLib import DICOMUtils
         DICOMUtils.loadSeriesByUID([series_uid])
-
         candidates = []
         for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
             if node.GetID() in before_ids or node.GetImageData() is None:
@@ -194,27 +275,15 @@ class DSAFlowLogic(ScriptedLoadableModuleLogic):
             if uid == series_uid:
                 return node
             candidates.append(node)
-
-        # Some DICOM plugins do not propagate SeriesInstanceUID to the MRML node.
-        # In that case select the newly-loaded scalar volume with the expected depth.
         expected_slices = len(files)
-        depth_matches = []
-        for node in candidates:
-            dims = node.GetImageData().GetDimensions()
-            if dims[2] == expected_slices:
-                depth_matches.append(node)
+        depth_matches = [n for n in candidates if n.GetImageData().GetDimensions()[2] == expected_slices]
         if len(depth_matches) == 1:
             depth_matches[0].SetAttribute("DICOM.SeriesInstanceUID", series_uid)
             return depth_matches[0]
-
         if len(candidates) == 1:
             candidates[0].SetAttribute("DICOM.SeriesInstanceUID", series_uid)
             return candidates[0]
-
-        raise RuntimeError(
-            f"DICOM loader ran, but DSAFlow could not uniquely identify the 3D volume. "
-            f"Expected {expected_slices} slices; newly loaded scalar volumes: {len(candidates)}."
-        )
+        raise RuntimeError(f"Could not uniquely identify loaded 3D volume; expected {expected_slices} slices, got {len(candidates)} new scalar volumes.")
 
     def volumeRange(self, volume_node):
         return self._libs()[1].scalar_range(volume_node)
@@ -222,8 +291,17 @@ class DSAFlowLogic(ScriptedLoadableModuleLogic):
     def autoThreshold(self, volume_node):
         return self._libs()[1].percentile_threshold(volume_node, 99.0)
 
-    def preview(self, volume_node, lower, segmentation_node=None):
-        return self._libs()[1].create_preview(volume_node, lower, None, segmentation_node)
+    def rawPreview(self, volume_node, lower, upper, segmentation_node=None):
+        return self._libs()[1].create_preview(volume_node, lower, upper, segmentation_node)
+
+    def cleanPreview(self, volume_node, lower, upper, min_voxels, max_components, segmentation_node=None):
+        return self._libs()[1].create_clean_preview(volume_node, lower, upper, min_voxels, max_components, segmentation_node)
+
+    def setMode(self, segmentation_node, mode):
+        return self._libs()[1].set_preview_mode(segmentation_node, mode)
+
+    def create3D(self, segmentation_node):
+        return self._libs()[1].create_controlled_3d_surface(segmentation_node)
 
     def formatReports(self, reports):
         if not reports:
