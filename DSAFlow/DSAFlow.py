@@ -80,7 +80,7 @@ class DSAFlowWidget(ScriptedLoadableModuleWidget):
         self.acceptButton.connect("clicked()", self.onAccept)
         self.layout.addWidget(self.acceptButton)
 
-        note = qt.QLabel("The threshold is a starting estimate, not a validated vessel classifier. Inspect the overlay in axial/coronal/sagittal and 3D views before accepting. No direct patient identifiers are displayed.")
+        note = qt.QLabel("The 3DANGIO SUB series is already a vendor-generated subtraction reconstruction; DSAFlow does not subtract Fill-Mask again at this step. Preview is shown in 2D first to avoid an unnecessary full-volume surface extraction. No direct patient identifiers are displayed.")
         note.wordWrap = True
         self.layout.addWidget(note)
         self.layout.addStretch(1)
@@ -106,7 +106,14 @@ class DSAFlowWidget(ScriptedLoadableModuleWidget):
             best = self.logic.best3DSub(self.reports)
             self.volumeNode = self.logic.loadSeries(best.series_uid)
             lo, hi = self.logic.volumeRange(self.volumeNode)
-            self.volumeStatus.text = f"Loaded: {self.volumeNode.GetName()} | intensity range {lo:.1f} to {hi:.1f}"
+            dims = self.volumeNode.GetImageData().GetDimensions()
+            spacing = self.volumeNode.GetSpacing()
+            self.volumeStatus.text = (
+                f"Loaded full 3D SUB: {self.volumeNode.GetName()} | "
+                f"dimensions {dims[0]}×{dims[1]}×{dims[2]} | "
+                f"spacing {spacing[0]:.4f}×{spacing[1]:.4f}×{spacing[2]:.4f} mm | "
+                f"intensity {lo:.1f} to {hi:.1f}"
+            )
             self.thresholdSpin.minimum = min(-5000, lo)
             self.thresholdSpin.maximum = max(100000, hi)
             self.thresholdSpin.enabled = True
@@ -115,7 +122,7 @@ class DSAFlowWidget(ScriptedLoadableModuleWidget):
             self.onAutoThreshold()
             slicer.util.setSliceViewerLayers(background=self.volumeNode, fit=True)
         except Exception as exc:
-            slicer.util.errorDisplay(f"Could not load 3D SUB volume:\n{exc}")
+            slicer.util.errorDisplay(f"Could not load full 3D SUB series:\n{exc}")
 
     def onAutoThreshold(self):
         try:
@@ -129,7 +136,7 @@ class DSAFlowWidget(ScriptedLoadableModuleWidget):
         try:
             self.segmentationNode = self.logic.preview(self.volumeNode, self.thresholdSpin.value, self.segmentationNode)
             self.acceptButton.enabled = True
-            self.volumeStatus.text = self.volumeStatus.text.split(" | preview")[0] + f" | preview ≥ {self.thresholdSpin.value:.1f}"
+            self.volumeStatus.text = self.volumeStatus.text.split(" | preview")[0] + f" | 2D preview ≥ {self.thresholdSpin.value:.1f}"
             slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
         except Exception as exc:
             slicer.util.errorDisplay(f"Preview failed:\n{exc}")
@@ -139,7 +146,7 @@ class DSAFlowWidget(ScriptedLoadableModuleWidget):
             return
         self.segmentationNode.SetName("DSAFlow_Vessels_Accepted")
         self.acceptButton.enabled = False
-        slicer.util.infoDisplay("Preview accepted. Segmentation remains editable in Segment Editor. Next milestone: connected-component cleanup, vascular model generation, and centerline extraction.")
+        slicer.util.infoDisplay("Preview accepted. Next milestone: crop/connected-component cleanup, then controlled 3D surface generation and centerline extraction.")
 
 
 class DSAFlowLogic(ScriptedLoadableModuleLogic):
@@ -158,25 +165,56 @@ class DSAFlowLogic(ScriptedLoadableModuleLogic):
         return max(candidates, key=lambda r: (r.valid, r.score, r.file_count), default=None)
 
     def loadSeries(self, series_uid):
+        """Load the complete DICOM series through Slicer's DICOM plugin machinery.
+
+        Do not call slicer.util.loadVolume on the first DICOM file: that route can
+        load only one slice or invoke a generic ITK reader and lose series geometry.
+        """
         db = slicer.dicomDatabase
         files = list(db.filesForSeries(series_uid))
         if not files:
             raise RuntimeError("Selected DICOM series contains no files.")
-        loaded_node_ids = []
-        success = slicer.util.loadVolume(files[0], properties={"singleFile": False}, returnNode=True)
-        if isinstance(success, tuple):
-            ok, node = success
-            if ok and node:
+
+        # Reuse an already-loaded matching volume when possible.
+        for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+            uid = node.GetAttribute("DICOM.SeriesInstanceUID")
+            if uid == series_uid and node.GetImageData() is not None:
                 return node
-        # Preferred DICOM route if direct volume loading does not work.
-        import DICOMLib
-        indexer = DICOMLib.DICOMUtils
-        loaded = indexer.loadSeriesByUID([series_uid])
-        if loaded:
-            for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
-                if node.GetAttribute("DICOM.SeriesInstanceUID") == series_uid:
-                    return node
-        raise RuntimeError("Slicer could not identify the loaded scalar volume for this SeriesInstanceUID.")
+
+        before_ids = {node.GetID() for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")}
+
+        from DICOMLib import DICOMUtils
+        DICOMUtils.loadSeriesByUID([series_uid])
+
+        candidates = []
+        for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+            if node.GetID() in before_ids or node.GetImageData() is None:
+                continue
+            uid = node.GetAttribute("DICOM.SeriesInstanceUID")
+            if uid == series_uid:
+                return node
+            candidates.append(node)
+
+        # Some DICOM plugins do not propagate SeriesInstanceUID to the MRML node.
+        # In that case select the newly-loaded scalar volume with the expected depth.
+        expected_slices = len(files)
+        depth_matches = []
+        for node in candidates:
+            dims = node.GetImageData().GetDimensions()
+            if dims[2] == expected_slices:
+                depth_matches.append(node)
+        if len(depth_matches) == 1:
+            depth_matches[0].SetAttribute("DICOM.SeriesInstanceUID", series_uid)
+            return depth_matches[0]
+
+        if len(candidates) == 1:
+            candidates[0].SetAttribute("DICOM.SeriesInstanceUID", series_uid)
+            return candidates[0]
+
+        raise RuntimeError(
+            f"DICOM loader ran, but DSAFlow could not uniquely identify the 3D volume. "
+            f"Expected {expected_slices} slices; newly loaded scalar volumes: {len(candidates)}."
+        )
 
     def volumeRange(self, volume_node):
         return self._libs()[1].scalar_range(volume_node)
