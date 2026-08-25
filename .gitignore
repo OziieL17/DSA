@@ -1,0 +1,34 @@
+# Clinical data / DICOM
+*.dcm
+*.dicom
+DICOM/
+data/
+clinical_data/
+patient_data/
+
+# Derived imaging
+*.nrrd
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.vtk
+*.vtp
+*.stl
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# macOS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Slicer temporary output
+*.mrml
+*.mrb
+Temp/
