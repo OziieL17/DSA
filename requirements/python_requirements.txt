@@ -1,0 +1,4 @@
+# Dependencies available inside Slicer should not be blindly pip-installed.
+# External Python dependencies will be pinned only after compatibility testing.
+numpy
+scipy
